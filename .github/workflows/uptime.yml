@@ -85,3 +85,5 @@ jobs:
         with:
           path: state
           key: uptime-state-${{ github.run_id }}
+
+# Мониторинг доступности Achilles
