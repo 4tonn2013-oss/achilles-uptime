@@ -1,0 +1,87 @@
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a test Telegram alert'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: uptime-state-current
+          restore-keys: uptime-state-
+
+      - name: Check site and alert
+        env:
+          TG_TOKEN: ${{ secrets.UPTIME_TG_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.UPTIME_TG_CHAT_ID }}
+          TARGET: https://analytics.achilles.bz/login
+          TEST_ALERT: ${{ inputs.test_alert }}
+        run: |
+          mkdir -p state
+          send() {
+            curl -s -m 15 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" --data-urlencode text="$1" >/dev/null || true
+          }
+
+          if [ "$TEST_ALERT" = "true" ]; then
+            send "🔔 Тестовый алерт: мониторинг Achilles работает. Проверка каждые 5 минут: $TARGET"
+          fi
+
+          prev=$(cat state/status 2>/dev/null || echo up)
+          last_alert=$(cat state/last_alert 2>/dev/null || echo 0)
+          now=$(date +%s)
+
+          # 3 попытки с паузой, чтобы не алертить на единичный сетевой чих
+          ok=0; code=000
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$TARGET" || echo 000)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 10
+          done
+
+          if [ "$ok" = "1" ]; then
+            if [ "$prev" = "down" ]; then
+              since=$(cat state/down_since 2>/dev/null || echo "$now")
+              mins=$(( (now - since) / 60 ))
+              send "✅ Achilles снова доступен (простой ~${mins} мин)."
+            fi
+            echo up > state/status
+            rm -f state/down_since
+          else
+            if [ "$prev" != "down" ]; then
+              echo "$now" > state/down_since
+              echo "$now" > state/last_alert
+              send "🔴 Achilles недоступен! $TARGET не отвечает (HTTP $code). Проверьте сервер и баланс Selectel."
+            elif [ $(( now - last_alert )) -gt 1800 ]; then
+              since=$(cat state/down_since 2>/dev/null || echo "$now")
+              mins=$(( (now - since) / 60 ))
+              echo "$now" > state/last_alert
+              send "🔴 Achilles всё ещё недоступен (~${mins} мин)."
+            fi
+            echo down > state/status
+          fi
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}
