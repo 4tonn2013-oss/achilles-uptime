@@ -10,8 +10,10 @@ on:
         type: boolean
         default: false
 
+# actions: write - чтобы раз в сутки продлевать себе жизнь (см. шаг Keepalive).
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: uptime
@@ -28,11 +30,10 @@ jobs:
           key: uptime-state-current
           restore-keys: uptime-state-
 
-      - name: Check site and alert
+      - name: Check site, scheduler and alert
         env:
           TG_TOKEN: ${{ secrets.UPTIME_TG_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.UPTIME_TG_CHAT_ID }}
-          TARGET: https://analytics.achilles.bz/login
           TEST_ALERT: ${{ inputs.test_alert }}
         run: |
           mkdir -p state
@@ -42,41 +43,60 @@ jobs:
           }
 
           if [ "$TEST_ALERT" = "true" ]; then
-            send "🔔 Тестовый алерт: мониторинг Achilles работает. Проверка каждые 5 минут: $TARGET"
+            send "🔔 Тестовый алерт: мониторинг Achilles работает. Каждые 5 минут проверяются сайт и планировщик (синк, ОКК, отчёты)."
           fi
 
-          prev=$(cat state/status 2>/dev/null || echo up)
-          last_alert=$(cat state/last_alert 2>/dev/null || echo 0)
-          now=$(date +%s)
+          # check <имя-состояния> <url> <что сломано> <что проверить>
+          # 3 попытки с паузой, чтобы не алертить на единичный сетевой чих;
+          # повтор тревоги раз в 30 минут, отбой - когда снова 200.
+          check() {
+            name=$1; url=$2; what=$3; hint=$4
+            prev=$(cat "state/${name}_status" 2>/dev/null || echo up)
+            last_alert=$(cat "state/${name}_last_alert" 2>/dev/null || echo 0)
+            now=$(date +%s)
 
-          # 3 попытки с паузой, чтобы не алертить на единичный сетевой чих
-          ok=0; code=000
-          for i in 1 2 3; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$TARGET" || echo 000)
-            if [ "$code" = "200" ]; then ok=1; break; fi
-            sleep 10
-          done
+            ok=0; code=000
+            for i in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$url" || echo 000)
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 10
+            done
 
-          if [ "$ok" = "1" ]; then
-            if [ "$prev" = "down" ]; then
-              since=$(cat state/down_since 2>/dev/null || echo "$now")
-              mins=$(( (now - since) / 60 ))
-              send "✅ Achilles снова доступен (простой ~${mins} мин)."
+            if [ "$ok" = "1" ]; then
+              if [ "$prev" = "down" ]; then
+                since=$(cat "state/${name}_down_since" 2>/dev/null || echo "$now")
+                send "✅ ${what}: снова в порядке (сбой ~$(( (now - since) / 60 )) мин)."
+              fi
+              echo up > "state/${name}_status"
+              rm -f "state/${name}_down_since"
+            else
+              if [ "$prev" != "down" ]; then
+                echo "$now" > "state/${name}_down_since"
+                echo "$now" > "state/${name}_last_alert"
+                send "🔴 ${what}! $url отвечает HTTP $code. ${hint}"
+              elif [ $(( now - last_alert )) -gt 1800 ]; then
+                since=$(cat "state/${name}_down_since" 2>/dev/null || echo "$now")
+                echo "$now" > "state/${name}_last_alert"
+                send "🔴 ${what} - всё ещё (~$(( (now - since) / 60 )) мин)."
+              fi
+              echo down > "state/${name}_status"
             fi
-            echo up > state/status
-            rm -f state/down_since
-          else
-            if [ "$prev" != "down" ]; then
-              echo "$now" > state/down_since
-              echo "$now" > state/last_alert
-              send "🔴 Achilles недоступен! $TARGET не отвечает (HTTP $code). Проверьте сервер и баланс Selectel."
-            elif [ $(( now - last_alert )) -gt 1800 ]; then
-              since=$(cat state/down_since 2>/dev/null || echo "$now")
-              mins=$(( (now - since) / 60 ))
-              echo "$now" > state/last_alert
-              send "🔴 Achilles всё ещё недоступен (~${mins} мин)."
-            fi
-            echo down > state/status
+          }
+
+          # Совместимость со старым состоянием (до проверки планировщика).
+          [ -f state/status ] && mv state/status state/site_status
+          [ -f state/down_since ] && mv state/down_since state/site_down_since
+          [ -f state/last_alert ] && mv state/last_alert state/site_last_alert
+
+          check site https://analytics.achilles.bz/login \
+            "Achilles недоступен" "Проверьте сервер и баланс Selectel."
+
+          # Сайт может работать, а планировщик молча стоять: тогда нет синка
+          # amoCRM, оценок ОКК и отчётов. Если лежит весь сайт - про
+          # планировщик отдельно не тревожим.
+          if [ "$(cat state/site_status)" = "up" ]; then
+            check scheduler https://analytics.achilles.bz/api/health/scheduler \
+              "Планировщик Achilles стоит" "Синк amoCRM, ОКК и отчёты не идут. Проверьте cron (schedule:run) на сервере."
           fi
 
       - name: Save state
@@ -86,4 +106,17 @@ jobs:
           path: state
           key: uptime-state-${{ github.run_id }}
 
-# Мониторинг доступности Achilles
+      # GitHub выключает расписание после 60 дней без коммитов в репозитории
+      # (так монитор и простоял с сентября). Раз в сутки (и при ручном запуске)
+      # «включаем» workflow заново через API - это сбрасывает счётчик
+      # неактивности без коммитов.
+      - name: Keepalive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(date -u +%H%M)" \< "0010" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime.yml/enable" && echo "keepalive: ok"
+          else
+            echo "keepalive: не сейчас (раз в сутки около 00:00 UTC)"
+          fi
